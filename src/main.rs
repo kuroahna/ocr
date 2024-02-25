@@ -1,7 +1,8 @@
 use std::ffi::CString;
+use std::io::Cursor;
 use std::net::SocketAddr;
 use std::str::from_utf8;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::body::Body;
 use axum::extract::{Multipart, State};
@@ -9,9 +10,12 @@ use axum::http::{Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::Router;
-use image::{DynamicImage, EncodableLayout, Rgba};
+use image::{DynamicImage, EncodableLayout, ImageOutputFormat, Rgba};
 use imageproc::rect::Rect;
+use regex::Regex;
+use reqwest::multipart;
 use serde::Deserialize;
+use serde_json::Value;
 use tesseract_plumbing::tesseract_sys::TessOcrEngineMode_OEM_LSTM_ONLY;
 use tesseract_plumbing::TessBaseApi;
 use tokio::sync::Mutex;
@@ -19,6 +23,8 @@ use tokio::sync::Mutex;
 use crate::websocket::ServerStarted;
 
 mod websocket;
+
+static GOOGLE_LENS_OCR_RESPONSE_REGEX: OnceLock<Regex> = OnceLock::new();
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -78,7 +84,18 @@ struct GaussianBlurOperation {
 }
 
 #[derive(Deserialize)]
-struct Operations {
+enum OcrEngine {
+    #[serde(rename = "tesseract")]
+    Tesseract,
+    #[serde(rename = "googleLens")]
+    GoogleLens,
+}
+
+#[derive(Deserialize)]
+struct OcrRequest {
+    #[serde(rename = "ocrEngine")]
+    ocr_engine: OcrEngine,
+    #[serde(rename = "operations")]
     operations: Vec<Operation>,
 }
 
@@ -99,14 +116,14 @@ impl TryFrom<&str> for MultipartRequestFormField {
     }
 }
 
-struct RequestBuilder {
+struct MultipartRequestBuilder {
     image: Option<Vec<u8>>,
     request: Option<String>,
 }
 
-impl RequestBuilder {
+impl MultipartRequestBuilder {
     fn new() -> Self {
-        RequestBuilder {
+        MultipartRequestBuilder {
             image: None,
             request: None,
         }
@@ -122,7 +139,7 @@ impl RequestBuilder {
         self
     }
 
-    fn build(self) -> Result<TheRequest, String> {
+    fn build(self) -> Result<MultipartRequest, String> {
         let image = match self.image {
             Some(image) => match image::load_from_memory(image.as_bytes()) {
                 Ok(image) => image,
@@ -130,9 +147,10 @@ impl RequestBuilder {
             },
             None => return Err("image is missing".to_string()),
         };
-        let request: Operations = match self.request {
+        let request: OcrRequest = match self.request {
             Some(request) => match request.is_empty() {
-                true => Operations {
+                true => OcrRequest {
+                    ocr_engine: OcrEngine::Tesseract,
                     operations: Vec::new(),
                 },
                 false => match serde_json::from_str(request.as_str()) {
@@ -140,24 +158,25 @@ impl RequestBuilder {
                     Err(e) => return Err(e.to_string()),
                 },
             },
-            None => Operations {
+            None => OcrRequest {
+                ocr_engine: OcrEngine::Tesseract,
                 operations: Vec::new(),
             },
         };
-        Ok(TheRequest { image, request })
+        Ok(MultipartRequest { image, request })
     }
 }
 
-struct TheRequest {
+struct MultipartRequest {
     image: DynamicImage,
-    request: Operations,
+    request: OcrRequest,
 }
 
 async fn ocr(
     State(state): State<Arc<Mutex<AppState>>>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    let mut builder = RequestBuilder::new();
+    let mut builder = MultipartRequestBuilder::new();
     while let Some(field) = multipart.next_field().await.unwrap() {
         let name = field.name().unwrap().to_string();
         let value = field.bytes().await.unwrap();
@@ -173,8 +192,8 @@ async fn ocr(
             }
         };
     }
-    let the_request = match builder.build() {
-        Ok(the_request) => the_request,
+    let multipart_request = match builder.build() {
+        Ok(multipart_request) => multipart_request,
         Err(e) => {
             println!("{}", e);
             return Response::builder()
@@ -184,9 +203,9 @@ async fn ocr(
         }
     };
 
-    let mut img = the_request.image;
-    let operations = the_request.request;
-    for operation in operations.operations {
+    let mut img = multipart_request.image;
+    let request = multipart_request.request;
+    for operation in request.operations {
         match operation {
             Operation::Invert(_) => {
                 println!("Inverting image");
@@ -243,20 +262,87 @@ async fn ocr(
     let img = img.to_rgb8();
     img.save("output.png").unwrap();
 
+    let text = match request.ocr_engine {
+        OcrEngine::Tesseract => {
+            let mut locked_state = state.lock().await;
+            locked_state
+                .tesseract_api
+                .set_image(
+                    img.as_bytes(),
+                    img.width().try_into().unwrap(),
+                    img.height().try_into().unwrap(),
+                    3,
+                    (3 * img.width()).try_into().unwrap(),
+                )
+                .unwrap();
+            let utf8_text = locked_state.tesseract_api.get_utf8_text().unwrap();
+            utf8_text.as_ref().to_str().unwrap().to_string()
+        }
+        OcrEngine::GoogleLens => {
+            let mut png_bytes = Cursor::new(Vec::new());
+            img.write_to(&mut png_bytes, ImageOutputFormat::Png)
+                .unwrap();
+            let client = reqwest::Client::new();
+            let form_part = multipart::Part::bytes(png_bytes.into_inner())
+                .file_name("image.png")
+                .mime_str("image/png")
+                .unwrap();
+            let form = multipart::Form::new().part("encoded_image", form_part);
+            match client
+                .post("https://lens.google.com/v3/upload")
+                .multipart(form)
+                .send()
+                .await
+            {
+                Ok(res) => {
+                    if !res.status().is_success() {
+                        println!("Request to Google Lens was not successful");
+                        return Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Body::empty())
+                            .unwrap();
+                    }
+
+                    let text = res.text().await.unwrap();
+                    let json5_str = GOOGLE_LENS_OCR_RESPONSE_REGEX
+                        .get()
+                        .expect("The Google Lens OCR response regex should be initialized upon startup")
+                        .captures(text.as_str())
+                        .unwrap()
+                        .get(1)
+                        .unwrap()
+                        .as_str();
+                    let value: Value = json5::from_str(json5_str).unwrap();
+                    let data = value
+                        .get("data")
+                        .unwrap()
+                        .get(3)
+                        .unwrap()
+                        .get(4)
+                        .unwrap()
+                        .get(0)
+                        .unwrap();
+                    let mut result = String::new();
+                    for lines in data.as_array().unwrap() {
+                        for text in lines.as_array().unwrap() {
+                            result.push_str(text.as_str().unwrap());
+                        }
+                    }
+                    result
+                }
+                Err(e) => {
+                    println!("Failed to send request to Google Lens: {}", e);
+                    return Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::empty())
+                        .unwrap();
+                }
+            }
+        }
+    };
+
     {
-        let mut locked_state = state.lock().await;
-        locked_state
-            .tesseract_api
-            .set_image(
-                img.as_bytes(),
-                img.width().try_into().unwrap(),
-                img.height().try_into().unwrap(),
-                3,
-                (3 * img.width()).try_into().unwrap(),
-            )
-            .unwrap();
-        let utf8_text = locked_state.tesseract_api.get_utf8_text().unwrap();
-        let text = utf8_text.as_ref().to_str().unwrap();
+        let locked_state = state.lock().await;
         let whitespace_removed: String = text
             .lines()
             .map(|line| {
@@ -309,6 +395,10 @@ async fn main() {
     let app = Router::new()
         .route("/api/v1/ocr", post(ocr))
         .with_state(state);
+
+    GOOGLE_LENS_OCR_RESPONSE_REGEX.get_or_init(|| {
+        Regex::new(r">AF_initDataCallback\((\{key: 'ds:1'.*?)\);</script>").unwrap()
+    });
 
     println!("Starting HTTP server at `0.0.0.0:9090`");
     let addr = SocketAddr::from(([0, 0, 0, 0], 9090));
