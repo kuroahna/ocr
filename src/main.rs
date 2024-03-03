@@ -244,13 +244,14 @@ impl Ocr {
     async fn text(&self, tesseract_api: &mut TessBaseApi) -> Result<String, String> {
         let text = match self.ocr_engine {
             OcrEngine::Tesseract => {
+                let img = self.image.to_rgb8();
                 tesseract_api
                     .set_image(
-                        self.image.as_bytes(),
-                        self.image.width().try_into().unwrap(),
-                        self.image.height().try_into().unwrap(),
+                        img.as_bytes(),
+                        img.width().try_into().unwrap(),
+                        img.height().try_into().unwrap(),
                         3,
-                        (3 * self.image.width()).try_into().unwrap(),
+                        (3 * img.width()).try_into().unwrap(),
                     )
                     .unwrap();
                 tesseract_api
