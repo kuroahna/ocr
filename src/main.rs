@@ -7,58 +7,97 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Response, StatusCode};
 use axum::response::IntoResponse;
-use axum::Router;
 use axum::routing::post;
-use axum_typed_multipart::{TryFromMultipart, TypedMultipart};
+use axum::Router;
+use axum_typed_multipart::TypedMultipart;
 use image::{DynamicImage, EncodableLayout, ImageOutputFormat, Rgba};
 use imageproc::rect::Rect;
 use regex::Regex;
 use reqwest::multipart;
-use serde::Deserialize;
 use serde_json::Value;
-use tesseract_plumbing::TessBaseApi;
 use tesseract_plumbing::tesseract_sys::TessOcrEngineMode_OEM_LSTM_ONLY;
+use tesseract_plumbing::TessBaseApi;
 use tokio::sync::Mutex;
 
+use crate::api::{
+    BinarizeOperationRequest, CropOperationRequest, DrawFilledRectangleOperationRequest,
+    GaussianBlurOperationRequest, MultipartRequest, OcrEngineRequest, OcrRequest, OperationRequest,
+    OtsuBinarizeOperationRequest,
+};
 use crate::websocket::ServerStarted;
 
+mod api;
 mod websocket;
 
 static GOOGLE_LENS_OCR_RESPONSE_REGEX: OnceLock<Regex> = OnceLock::new();
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-#[derive(Deserialize)]
-#[serde(tag = "type")]
+enum OcrEngine {
+    Tesseract,
+    GoogleLens,
+}
+
+impl From<OcrEngineRequest> for OcrEngine {
+    fn from(value: OcrEngineRequest) -> Self {
+        match value {
+            OcrEngineRequest::Tesseract => Self::Tesseract,
+            OcrEngineRequest::GoogleLens => Self::GoogleLens,
+        }
+    }
+}
+
 enum Operation {
-    #[serde(rename = "invert")]
-    Invert(InvertOperation),
-    #[serde(rename = "binarize")]
+    Invert,
     Binarize(BinarizeOperation),
-    #[serde(rename = "otsuBinarize")]
     OtsuBinarize(OtsuBinarizeOperation),
-    #[serde(rename = "crop")]
     Crop(CropOperation),
-    #[serde(rename = "drawFilledRectangle")]
     DrawFilledRectangle(DrawFilledRectangleOperation),
-    #[serde(rename = "gaussianBlur")]
     GaussianBlur(GaussianBlurOperation),
 }
 
-#[derive(Deserialize)]
-struct InvertOperation {}
+impl From<OperationRequest> for Operation {
+    fn from(value: OperationRequest) -> Self {
+        match value {
+            OperationRequest::Invert => Self::Invert,
+            OperationRequest::Binarize(op) => Self::Binarize(BinarizeOperation::from(op)),
+            OperationRequest::OtsuBinarize(op) => {
+                Self::OtsuBinarize(OtsuBinarizeOperation::from(op))
+            }
+            OperationRequest::Crop(op) => Self::Crop(CropOperation::from(op)),
+            OperationRequest::DrawFilledRectangle(op) => {
+                Self::DrawFilledRectangle(DrawFilledRectangleOperation::from(op))
+            }
+            OperationRequest::GaussianBlur(op) => {
+                Self::GaussianBlur(GaussianBlurOperation::from(op))
+            }
+        }
+    }
+}
 
-#[derive(Deserialize)]
 struct BinarizeOperation {
     threshold: u8,
 }
 
-#[derive(Deserialize)]
-struct OtsuBinarizeOperation {
-    #[serde(rename = "invertThreshold")]
-    invert_threshold: Option<bool>,
+impl From<BinarizeOperationRequest> for BinarizeOperation {
+    fn from(value: BinarizeOperationRequest) -> Self {
+        Self {
+            threshold: value.threshold,
+        }
+    }
 }
 
-#[derive(Deserialize)]
+struct OtsuBinarizeOperation {
+    invert_threshold: bool,
+}
+
+impl From<OtsuBinarizeOperationRequest> for OtsuBinarizeOperation {
+    fn from(value: OtsuBinarizeOperationRequest) -> Self {
+        Self {
+            invert_threshold: value.invert_threshold,
+        }
+    }
+}
+
 struct CropOperation {
     x: u32,
     y: u32,
@@ -66,7 +105,17 @@ struct CropOperation {
     height: u32,
 }
 
-#[derive(Deserialize)]
+impl From<CropOperationRequest> for CropOperation {
+    fn from(value: CropOperationRequest) -> Self {
+        Self {
+            x: value.x,
+            y: value.y,
+            width: value.width,
+            height: value.height,
+        }
+    }
+}
+
 struct DrawFilledRectangleOperation {
     x: i32,
     y: i32,
@@ -78,179 +127,205 @@ struct DrawFilledRectangleOperation {
     a: u8,
 }
 
-#[derive(Deserialize)]
+impl From<DrawFilledRectangleOperationRequest> for DrawFilledRectangleOperation {
+    fn from(value: DrawFilledRectangleOperationRequest) -> Self {
+        Self {
+            x: value.x,
+            y: value.y,
+            width: value.width,
+            height: value.height,
+            r: value.r,
+            g: value.g,
+            b: value.b,
+            a: value.a,
+        }
+    }
+}
+
 struct GaussianBlurOperation {
-    #[serde(rename = "sigma")]
     sigma: f32,
 }
 
-#[derive(Deserialize)]
-enum OcrEngine {
-    #[serde(rename = "tesseract")]
-    Tesseract,
-    #[serde(rename = "googleLens")]
-    GoogleLens,
+impl From<GaussianBlurOperationRequest> for GaussianBlurOperation {
+    fn from(value: GaussianBlurOperationRequest) -> Self {
+        Self { sigma: value.sigma }
+    }
 }
 
-#[derive(Deserialize)]
-struct OcrRequest {
-    #[serde(rename = "ocrEngine")]
+struct Ocr {
+    image: DynamicImage,
     ocr_engine: OcrEngine,
-    #[serde(rename = "operations")]
     operations: Vec<Operation>,
 }
 
-#[derive(TryFromMultipart)]
-struct MultipartRequest {
-    image: axum::body::Bytes,
-    request: String,
+impl TryFrom<TypedMultipart<MultipartRequest>> for Ocr {
+    type Error = String;
+
+    fn try_from(value: TypedMultipart<MultipartRequest>) -> Result<Self, Self::Error> {
+        let image = match image::load_from_memory(value.image.as_bytes()) {
+            Ok(image) => image,
+            Err(e) => return Err(e.to_string()),
+        };
+        let request: OcrRequest = match serde_json::from_str::<OcrRequest>(value.request.as_str()) {
+            Ok(request) => request,
+            Err(e) => return Err(e.to_string()),
+        };
+        let ocr_engine = OcrEngine::from(request.ocr_engine);
+        let mut operations = Vec::new();
+        for operation in request.operations {
+            operations.push(Operation::from(operation));
+        }
+
+        Ok(Self {
+            image,
+            ocr_engine,
+            operations,
+        })
+    }
 }
 
-async fn ocr(
-    State(state): State<Arc<Mutex<AppState>>>,
-    multipart: TypedMultipart<MultipartRequest>,
-) -> impl IntoResponse {
-    let mut img = image::load_from_memory(multipart.image.as_bytes()).unwrap();
-    let request: OcrRequest = serde_json::from_str(multipart.request.as_str()).unwrap();
-
-    for operation in request.operations {
-        match operation {
-            Operation::Invert(_) => {
-                println!("Inverting image");
-                img.invert();
-            }
-            Operation::Binarize(op) => {
-                println!("Binarizing image with threshold `{}`", op.threshold);
-                let mut grayscale_img = img.to_luma8();
-                imageproc::contrast::threshold_mut(&mut grayscale_img, op.threshold);
-                img = DynamicImage::ImageLuma8(grayscale_img);
-            }
-            Operation::OtsuBinarize(op) => {
-                let invert_threshold = op.invert_threshold.unwrap_or(false);
-                let mut grayscale_img = img.to_luma8();
-                let otsu_level = imageproc::contrast::otsu_level(&grayscale_img);
-                let threshold_value = match invert_threshold {
-                    true => 255 - otsu_level,
-                    false => otsu_level,
-                };
-                println!(
-                    "Otsu level found `{}` and binarizing image with threshold `{}`",
-                    otsu_level, threshold_value
-                );
-                imageproc::contrast::threshold_mut(&mut grayscale_img, threshold_value);
-                img = DynamicImage::ImageLuma8(grayscale_img);
-            }
-            Operation::Crop(op) => {
-                println!(
-                    "Cropping image with x `{}`, y `{}`, width `{}`, height `{}`",
-                    op.x, op.y, op.width, op.height
-                );
-                img = img.crop(op.x, op.y, op.width, op.height);
-            }
-            Operation::DrawFilledRectangle(op) => {
-                println!(
-                    "Drawing filled rectangle with x `{}`, y `{}`, width `{}`, height `{}`, r `{}`, g `{}`, b `{}`, a `{}`",
-                    op.x, op.y, op.width, op.height, op.r, op.g, op.b, op.a
-                );
-                let out = imageproc::drawing::draw_filled_rect(
-                    &img,
-                    Rect::at(op.x, op.y).of_size(op.width, op.height),
-                    Rgba([op.r, op.g, op.b, op.a]),
-                );
-                img = DynamicImage::ImageRgba8(out);
-            }
-            Operation::GaussianBlur(op) => {
-                println!("Gaussian blurring image with sigma `{}`", op.sigma);
-                let grayscale_img = img.to_luma8();
-                let out = imageproc::filter::gaussian_blur_f32(&grayscale_img, op.sigma);
-                img = DynamicImage::ImageLuma8(out);
+impl Ocr {
+    fn transform_image(&mut self) {
+        for operation in &self.operations {
+            match operation {
+                Operation::Invert => {
+                    println!("Inverting image");
+                    self.image.invert();
+                }
+                Operation::Binarize(op) => {
+                    println!("Binarizing image with threshold `{}`", op.threshold);
+                    let mut grayscale_img = self.image.to_luma8();
+                    imageproc::contrast::threshold_mut(&mut grayscale_img, op.threshold);
+                    self.image = DynamicImage::ImageLuma8(grayscale_img);
+                }
+                Operation::OtsuBinarize(op) => {
+                    let mut grayscale_img = self.image.to_luma8();
+                    let otsu_level = imageproc::contrast::otsu_level(&grayscale_img);
+                    let threshold_value = match op.invert_threshold {
+                        true => 255 - otsu_level,
+                        false => otsu_level,
+                    };
+                    println!(
+                        "Otsu level found `{}` and binarizing image with threshold `{}`",
+                        otsu_level, threshold_value
+                    );
+                    imageproc::contrast::threshold_mut(&mut grayscale_img, threshold_value);
+                    self.image = DynamicImage::ImageLuma8(grayscale_img);
+                }
+                Operation::Crop(op) => {
+                    println!(
+                        "Cropping image with x `{}`, y `{}`, width `{}`, height `{}`",
+                        op.x, op.y, op.width, op.height
+                    );
+                    self.image = self.image.crop(op.x, op.y, op.width, op.height);
+                }
+                Operation::DrawFilledRectangle(op) => {
+                    println!(
+                        "Drawing filled rectangle with x `{}`, y `{}`, width `{}`, height `{}`, r `{}`, g `{}`, b `{}`, a `{}`",
+                        op.x, op.y, op.width, op.height, op.r, op.g, op.b, op.a
+                    );
+                    let out = imageproc::drawing::draw_filled_rect(
+                        &self.image,
+                        Rect::at(op.x, op.y).of_size(op.width, op.height),
+                        Rgba([op.r, op.g, op.b, op.a]),
+                    );
+                    self.image = DynamicImage::ImageRgba8(out);
+                }
+                Operation::GaussianBlur(op) => {
+                    println!("Gaussian blurring image with sigma `{}`", op.sigma);
+                    let grayscale_img = self.image.to_luma8();
+                    let out = imageproc::filter::gaussian_blur_f32(&grayscale_img, op.sigma);
+                    self.image = DynamicImage::ImageLuma8(out);
+                }
             }
         }
     }
-    let img = img.to_rgb8();
 
-    let text = match request.ocr_engine {
-        OcrEngine::Tesseract => {
-            let mut locked_state = state.lock().await;
-            locked_state
-                .tesseract_api
-                .set_image(
-                    img.as_bytes(),
-                    img.width().try_into().unwrap(),
-                    img.height().try_into().unwrap(),
-                    3,
-                    (3 * img.width()).try_into().unwrap(),
-                )
-                .unwrap();
-            let utf8_text = locked_state.tesseract_api.get_utf8_text().unwrap();
-            utf8_text.as_ref().to_str().unwrap().to_string()
-        }
-        OcrEngine::GoogleLens => {
-            let mut png_bytes = Cursor::new(Vec::new());
-            img.write_to(&mut png_bytes, ImageOutputFormat::Png)
-                .unwrap();
-            let form_part = multipart::Part::bytes(png_bytes.into_inner())
-                .file_name("image.png")
-                .mime_str("image/png")
-                .unwrap();
-            let form = multipart::Form::new().part("encoded_image", form_part);
-            match CLIENT
-                .get()
-                .expect("The client should be initialized upon startup")
-                .post("https://lens.google.com/v3/upload")
-                .multipart(form)
-                .send()
-                .await
-            {
-                Ok(res) => {
-                    if !res.status().is_success() {
-                        println!("Request to Google Lens was not successful");
-                        return Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .body(Body::empty())
-                            .unwrap();
-                    }
-
-                    let text = res.text().await.unwrap();
-                    let json5_str = GOOGLE_LENS_OCR_RESPONSE_REGEX
-                        .get()
-                        .expect("The regex should be initialized upon startup")
-                        .captures(text.as_str())
-                        .unwrap()
-                        .get(1)
-                        .unwrap()
-                        .as_str();
-                    let value: Value = json5::from_str(json5_str).unwrap();
-                    let data = value
-                        .get("data")
-                        .unwrap()
-                        .get(3)
-                        .unwrap()
-                        .get(4)
-                        .unwrap()
-                        .get(0)
-                        .unwrap();
-                    let mut result = String::new();
-                    for lines in data.as_array().unwrap() {
-                        for text in lines.as_array().unwrap() {
-                            result.push_str(text.as_str().unwrap());
+    async fn text(&self, tesseract_api: &mut TessBaseApi) -> Result<String, String> {
+        let text = match self.ocr_engine {
+            OcrEngine::Tesseract => {
+                tesseract_api
+                    .set_image(
+                        self.image.as_bytes(),
+                        self.image.width().try_into().unwrap(),
+                        self.image.height().try_into().unwrap(),
+                        3,
+                        (3 * self.image.width()).try_into().unwrap(),
+                    )
+                    .unwrap();
+                tesseract_api
+                    .get_utf8_text()
+                    .unwrap()
+                    .as_ref()
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            }
+            OcrEngine::GoogleLens => {
+                let mut png_bytes = Cursor::new(Vec::new());
+                self.image
+                    .write_to(&mut png_bytes, ImageOutputFormat::Png)
+                    .unwrap();
+                let form_part = multipart::Part::bytes(png_bytes.into_inner())
+                    .file_name("image.png")
+                    .mime_str("image/png")
+                    .unwrap();
+                let form = multipart::Form::new().part("encoded_image", form_part);
+                match CLIENT
+                    .get()
+                    .expect("The client should be initialized upon startup")
+                    .post("https://lens.google.com/v3/upload")
+                    .multipart(form)
+                    .send()
+                    .await
+                {
+                    Ok(res) => {
+                        if !res.status().is_success() {
+                            let error = format!(
+                                "Request to Google Lens was not successful. Status code: `{}`. Response body: `{}`",
+                                res.status().as_str(),
+                                res.text().await.unwrap()
+                            );
+                            println!("{}", error);
+                            return Err(error);
                         }
+
+                        let text = res.text().await.unwrap();
+                        let json5_str = GOOGLE_LENS_OCR_RESPONSE_REGEX
+                            .get()
+                            .expect("The regex should be initialized upon startup")
+                            .captures(text.as_str())
+                            .unwrap()
+                            .get(1)
+                            .unwrap()
+                            .as_str();
+                        let value: Value = json5::from_str(json5_str).unwrap();
+                        let data = value
+                            .get("data")
+                            .unwrap()
+                            .get(3)
+                            .unwrap()
+                            .get(4)
+                            .unwrap()
+                            .get(0)
+                            .unwrap();
+                        let mut result = String::new();
+                        for lines in data.as_array().unwrap() {
+                            for text in lines.as_array().unwrap() {
+                                result.push_str(text.as_str().unwrap());
+                            }
+                        }
+                        result
                     }
-                    result
-                }
-                Err(e) => {
-                    println!("Failed to send request to Google Lens: {}", e);
-                    return Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::empty())
-                        .unwrap();
+                    Err(e) => {
+                        let error = format!("Failed to send request to Google Lens: {}", e);
+                        println!("{}", error);
+                        return Err(error);
+                    }
                 }
             }
-        }
-    };
+        };
 
-    {
-        let locked_state = state.lock().await;
         let whitespace_removed: String = text
             .lines()
             .map(|line| {
@@ -261,12 +336,40 @@ async fn ocr(
             .collect::<Vec<String>>()
             .join("\n");
         println!("{}\n", whitespace_removed);
-        locked_state
-            .websocket_server
-            .send_message(whitespace_removed);
+        Ok(whitespace_removed)
     }
+}
 
-    img.save("output.png").unwrap();
+async fn ocr(
+    State(state): State<Arc<Mutex<AppState>>>,
+    multipart: TypedMultipart<MultipartRequest>,
+) -> impl IntoResponse {
+    let mut ocr = match Ocr::try_from(multipart) {
+        Ok(ocr) => ocr,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(e))
+                .unwrap()
+        }
+    };
+
+    ocr.transform_image();
+    {
+        let mut locked_state = state.lock().await;
+        let text = match ocr.text(&mut locked_state.tesseract_api).await {
+            Ok(text) => text,
+            Err(e) => {
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from(e))
+                    .unwrap()
+            }
+        };
+        locked_state.websocket_server.send_message(text);
+    }
+    ocr.image.to_rgb8().save("output.png").unwrap();
+
     Response::builder()
         .status(StatusCode::OK)
         .body(Body::empty())
