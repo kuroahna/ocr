@@ -1,23 +1,23 @@
 use std::ffi::CString;
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::str::from_utf8;
 use std::sync::{Arc, OnceLock};
 
 use axum::body::Body;
-use axum::extract::{Multipart, State};
+use axum::extract::State;
 use axum::http::{Response, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::post;
 use axum::Router;
+use axum::routing::post;
+use axum_typed_multipart::{TryFromMultipart, TypedMultipart};
 use image::{DynamicImage, EncodableLayout, ImageOutputFormat, Rgba};
 use imageproc::rect::Rect;
 use regex::Regex;
 use reqwest::multipart;
 use serde::Deserialize;
 use serde_json::Value;
-use tesseract_plumbing::tesseract_sys::TessOcrEngineMode_OEM_LSTM_ONLY;
 use tesseract_plumbing::TessBaseApi;
+use tesseract_plumbing::tesseract_sys::TessOcrEngineMode_OEM_LSTM_ONLY;
 use tokio::sync::Mutex;
 
 use crate::websocket::ServerStarted;
@@ -100,112 +100,19 @@ struct OcrRequest {
     operations: Vec<Operation>,
 }
 
-enum MultipartRequestFormField {
-    Image,
-    Request,
-}
-
-impl TryFrom<&str> for MultipartRequestFormField {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value.to_lowercase().as_str() {
-            "image" => Ok(MultipartRequestFormField::Image),
-            "request" => Ok(MultipartRequestFormField::Request),
-            _ => Err(format!("Unknown multipart form field name `{}`", value)),
-        }
-    }
-}
-
-struct MultipartRequestBuilder {
-    image: Option<Vec<u8>>,
-    request: Option<String>,
-}
-
-impl MultipartRequestBuilder {
-    fn new() -> Self {
-        MultipartRequestBuilder {
-            image: None,
-            request: None,
-        }
-    }
-
-    fn image(&mut self, image: Vec<u8>) -> &mut Self {
-        self.image = Some(image);
-        self
-    }
-
-    fn request(&mut self, request: String) -> &mut Self {
-        self.request = Some(request);
-        self
-    }
-
-    fn build(self) -> Result<MultipartRequest, String> {
-        let image = match self.image {
-            Some(image) => match image::load_from_memory(image.as_bytes()) {
-                Ok(image) => image,
-                Err(e) => return Err(e.to_string()),
-            },
-            None => return Err("image is missing".to_string()),
-        };
-        let request: OcrRequest = match self.request {
-            Some(request) => match request.is_empty() {
-                true => OcrRequest {
-                    ocr_engine: OcrEngine::Tesseract,
-                    operations: Vec::new(),
-                },
-                false => match serde_json::from_str(request.as_str()) {
-                    Ok(request) => request,
-                    Err(e) => return Err(e.to_string()),
-                },
-            },
-            None => OcrRequest {
-                ocr_engine: OcrEngine::Tesseract,
-                operations: Vec::new(),
-            },
-        };
-        Ok(MultipartRequest { image, request })
-    }
-}
-
+#[derive(TryFromMultipart)]
 struct MultipartRequest {
-    image: DynamicImage,
-    request: OcrRequest,
+    image: axum::body::Bytes,
+    request: String,
 }
 
 async fn ocr(
     State(state): State<Arc<Mutex<AppState>>>,
-    mut multipart: Multipart,
+    multipart: TypedMultipart<MultipartRequest>,
 ) -> impl IntoResponse {
-    let mut builder = MultipartRequestBuilder::new();
-    while let Some(field) = multipart.next_field().await.unwrap() {
-        let name = field.name().unwrap().to_string();
-        let value = field.bytes().await.unwrap();
+    let mut img = image::load_from_memory(multipart.image.as_bytes()).unwrap();
+    let request: OcrRequest = serde_json::from_str(multipart.request.as_str()).unwrap();
 
-        let key = match MultipartRequestFormField::try_from(name.as_str()) {
-            Ok(key) => key,
-            Err(_) => continue,
-        };
-        match key {
-            MultipartRequestFormField::Image => builder.image(value.to_vec()),
-            MultipartRequestFormField::Request => {
-                builder.request(from_utf8(value.as_bytes()).unwrap().to_string())
-            }
-        };
-    }
-    let multipart_request = match builder.build() {
-        Ok(multipart_request) => multipart_request,
-        Err(e) => {
-            println!("{}", e);
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from(e))
-                .unwrap();
-        }
-    };
-
-    let mut img = multipart_request.image;
-    let request = multipart_request.request;
     for operation in request.operations {
         match operation {
             Operation::Invert(_) => {
