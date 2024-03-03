@@ -25,6 +25,7 @@ use crate::websocket::ServerStarted;
 mod websocket;
 
 static GOOGLE_LENS_OCR_RESPONSE_REGEX: OnceLock<Regex> = OnceLock::new();
+static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -281,13 +282,14 @@ async fn ocr(
             let mut png_bytes = Cursor::new(Vec::new());
             img.write_to(&mut png_bytes, ImageOutputFormat::Png)
                 .unwrap();
-            let client = reqwest::Client::new();
             let form_part = multipart::Part::bytes(png_bytes.into_inner())
                 .file_name("image.png")
                 .mime_str("image/png")
                 .unwrap();
             let form = multipart::Form::new().part("encoded_image", form_part);
-            match client
+            match CLIENT
+                .get()
+                .expect("The client should be initialized upon startup")
                 .post("https://lens.google.com/v3/upload")
                 .multipart(form)
                 .send()
@@ -305,9 +307,7 @@ async fn ocr(
                     let text = res.text().await.unwrap();
                     let json5_str = GOOGLE_LENS_OCR_RESPONSE_REGEX
                         .get()
-                        .expect(
-                            "The Google Lens OCR response regex should be initialized upon startup",
-                        )
+                        .expect("The regex should be initialized upon startup")
                         .captures(text.as_str())
                         .unwrap()
                         .get(1)
@@ -401,6 +401,7 @@ async fn main() {
     GOOGLE_LENS_OCR_RESPONSE_REGEX.get_or_init(|| {
         Regex::new(r">AF_initDataCallback\((\{key: 'ds:1'.*?)\);</script>").unwrap()
     });
+    CLIENT.get_or_init(reqwest::Client::new);
 
     println!("Starting HTTP server at `0.0.0.0:9090`");
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 9090)))
