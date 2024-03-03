@@ -306,7 +306,9 @@ async fn ocr(
                     let text = res.text().await.unwrap();
                     let json5_str = GOOGLE_LENS_OCR_RESPONSE_REGEX
                         .get()
-                        .expect("The Google Lens OCR response regex should be initialized upon startup")
+                        .expect(
+                            "The Google Lens OCR response regex should be initialized upon startup",
+                        )
                         .captures(text.as_str())
                         .unwrap()
                         .get(1)
@@ -401,9 +403,8 @@ async fn main() {
     });
 
     println!("Starting HTTP server at `0.0.0.0:9090`");
-    let addr = SocketAddr::from(([0, 0, 0, 0], 9090));
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 9090)))
         .await
         .unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
