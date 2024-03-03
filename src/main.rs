@@ -260,7 +260,6 @@ async fn ocr(
         }
     }
     let img = img.to_rgb8();
-    img.save("output.png").unwrap();
 
     let text = match request.ocr_engine {
         OcrEngine::Tesseract => {
@@ -360,6 +359,7 @@ async fn ocr(
             .send_message(whitespace_removed);
     }
 
+    img.save("output.png").unwrap();
     Response::builder()
         .status(StatusCode::OK)
         .body(Body::empty())
