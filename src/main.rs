@@ -312,7 +312,8 @@ impl GoogleLensOcrEngine {
         let form = multipart::Form::new().part("encoded_image", form_part);
         match self
             .client
-            .post("https://lens.google.com/v3/upload")
+            // ep = entrypoint
+            .post("https://lens.google.com/v3/upload?ep=ccm")
             .multipart(form)
             .send()
             .await
