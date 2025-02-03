@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
@@ -456,6 +456,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/v1/ocr", post(ocr))
+        .layer(DefaultBodyLimit::disable())
         .with_state(state);
 
     println!("Starting HTTP server at `0.0.0.0:9090`");
