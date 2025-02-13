@@ -314,6 +314,7 @@ impl GoogleLensOcrEngine {
             .client
             // ep = entrypoint
             .post("https://lens.google.com/v3/upload?ep=ccm")
+            .header("User-Agent", "Mozilla")
             .multipart(form)
             .send()
             .await
