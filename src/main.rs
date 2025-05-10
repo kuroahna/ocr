@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
@@ -12,11 +12,17 @@ use axum::Router;
 use axum_typed_multipart::TypedMultipart;
 use image::{DynamicImage, EncodableLayout, ImageOutputFormat, Rgba};
 use imageproc::rect::Rect;
-use regex::Regex;
-use reqwest::multipart;
-use serde_json::Value;
 use tesseract_plumbing::tesseract_sys::TessOcrEngineMode_OEM_LSTM_ONLY;
 use tesseract_plumbing::TessBaseApi;
+use prost::Message;
+use proto::{
+    AppliedFilter, AppliedFilters, ImageData, ImageMetadata, ImagePayload,
+    LensOverlayClientContext, LensOverlayFilterType, LensOverlayObjectsRequest,
+    LensOverlayRequestContext, LensOverlayRequestId, LensOverlayServerRequest,
+    LensOverlayServerResponse, LocaleContext, Platform, Surface,
+};
+use rand::Rng;
+use uuid::Uuid;
 
 use crate::api::{
     BinarizeOperationRequest, CropOperationRequest, DrawFilledRectangleOperationRequest,
@@ -26,9 +32,8 @@ use crate::api::{
 use crate::websocket::ServerStarted;
 
 mod api;
+mod proto;
 mod websocket;
-
-static GOOGLE_LENS_RESPONSE_REGEX: OnceLock<Regex> = OnceLock::new();
 
 enum OcrEngine {
     Tesseract,
@@ -295,27 +300,71 @@ impl GoogleLensOcrEngine {
         }
     }
 
-    fn regex(&self) -> &'static Regex {
-        GOOGLE_LENS_RESPONSE_REGEX
-            .get_or_init(|| Regex::new(r"AF_initDataCallback\((\{key: 'ds:1'.*?})\)").unwrap())
-    }
-
     async fn ocr(&self, image: &DynamicImage) -> Result<String, String> {
         let mut png_bytes = Cursor::new(Vec::new());
         image
             .write_to(&mut png_bytes, ImageOutputFormat::Png)
             .unwrap();
-        let form_part = multipart::Part::bytes(png_bytes.into_inner())
-            .file_name("image.png")
-            .mime_str("image/png")
-            .unwrap();
-        let form = multipart::Form::new().part("encoded_image", form_part);
+
+        let request = LensOverlayServerRequest {
+            objects_request: Some(LensOverlayObjectsRequest {
+                request_context: Some(LensOverlayRequestContext {
+                    request_id: Some(LensOverlayRequestId {
+                        uuid: Uuid::new_v4().as_u64_pair().0,
+                        sequence_id: 1,
+                        image_sequence_id: 1,
+                        analytics_id: (0..16).map(|_| rand::rng().random()).collect(),
+                        long_context_id: 1,
+                        routing_info: None,
+                    }),
+                    client_context: Some(LensOverlayClientContext {
+                        platform: Platform::Web.into(),
+                        surface: Surface::Chromium.into(),
+                        locale_context: Some(LocaleContext {
+                            language: "ja".to_owned(),
+                            region: "Asia/Tokyo".to_owned(),
+                            // not set by chromium
+                            time_zone: "".to_owned(),
+                        }),
+                        // not set by chromium
+                        app_id: "".to_owned(),
+                        client_filters: Some(AppliedFilters {
+                            filter: vec![AppliedFilter {
+                                filter_type: LensOverlayFilterType::AutoFilter.into(),
+                                filter_payload: None,
+                            }],
+                        }),
+                        rendering_context: None,
+                        client_logging_data: None,
+                    }),
+                }),
+                image_data: Some(ImageData {
+                    payload: Some(ImagePayload {
+                        image_bytes: png_bytes.into_inner(),
+                    }),
+                    // TODO: resize if width * height > 3_000_000
+                    image_metadata: Some(ImageMetadata {
+                        width: i32::try_from(image.width()).unwrap(),
+                        height: i32::try_from(image.height()).unwrap(),
+                    }),
+                    significant_regions: Vec::new(),
+                }),
+                payload: None,
+                viewport_request_context: None,
+            }),
+            interaction_request: None,
+            client_logs: None,
+        };
+
+        let mut body = Vec::new();
+        request.encode(&mut body).unwrap();
+
         match self
             .client
-            // ep = entrypoint
-            .post("https://lens.google.com/v3/upload?ep=ccm")
-            .header("User-Agent", "Mozilla")
-            .multipart(form)
+            .post("https://lensfrontend-pa.googleapis.com/v1/crupload")
+            .header("Content-Type", "application/x-protobuf")
+            .header("X-Goog-Api-Key", "AIzaSyDr2UxVnv_U85AbhhY8XSHSIavUW0DC-sY")
+            .body(body)
             .send()
             .await
         {
@@ -330,30 +379,28 @@ impl GoogleLensOcrEngine {
                     return Err(error);
                 }
 
-                let text = res.text().await.unwrap();
-                let json5_str = self
-                    .regex()
-                    .captures(text.as_str())
-                    .unwrap()
-                    .get(1)
-                    .unwrap()
-                    .as_str();
-                let value: Value = json5::from_str(json5_str).unwrap();
-                let data = value
-                    .get("data")
-                    .unwrap()
-                    .get(3)
-                    .unwrap()
-                    .get(4)
-                    .unwrap()
-                    .get(0)
-                    .unwrap();
+                let response = res.bytes().await.unwrap();
+                let response = LensOverlayServerResponse::decode(response).unwrap();
+
                 let mut result = String::new();
-                for lines in data.as_array().unwrap() {
-                    for text in lines.as_array().unwrap() {
-                        result.push_str(text.as_str().unwrap());
+                if let Some(response) = response.objects_response {
+                    if let Some(text) = response.text {
+                        if let Some(layout) = text.text_layout {
+                            for paragraph in layout.paragraphs {
+                                for line in paragraph.lines {
+                                    for word in line.words {
+                                        result.push_str(&word.plain_text);
+                                        if let Some(separator) = word.text_separator {
+                                            result.push_str(&separator);
+                                        }
+                                    }
+                                }
+                                result.push('\n');
+                            }
+                        }
                     }
                 }
+
                 Ok(result)
             }
             Err(e) => {
